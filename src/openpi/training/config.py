@@ -20,6 +20,10 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+###############
+import openpi.policies.piper_policy as piper_policy
+import openpi.policies.double_piper_policy as double_piper_policy
+###############
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -322,6 +326,117 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+
+##################################################################
+@dataclasses.dataclass(frozen=True)
+class LeRobotPiperDataConfig(DataConfigFactory):
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+
+    adapt_to_pi: bool = False
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_high": "observation.images.top"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                piper_policy.PiperInputs(
+                    action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi
+                )
+            ],
+            outputs=[piper_policy.PiperOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotDoublePiperDataConfig(DataConfigFactory):
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+
+    adapt_to_pi: bool = False
+
+    # Repack transforms.
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"cam_high": "observation.images.top"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                double_piper_policy.PiperInputs(
+                    action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi
+                )
+            ],
+            outputs=[double_piper_policy.PiperOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+
+###############################################################3##
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -626,7 +741,7 @@ _CONFIGS = [
         num_train_steps=20_000,
     ),
     #
-    # Debugging configs.
+    # Debugging configs.cd 
     #
     TrainConfig(
         name="debug",
@@ -649,6 +764,39 @@ _CONFIGS = [
         exp_name="debug",
         num_train_steps=10,
         wandb_enabled=False,
+    ),
+
+    TrainConfig(
+        name="pi0_piper",
+        wandb_enabled=False,
+        model=pi0.Pi0Config(action_horizon=50, max_token_len=180),
+        data=LeRobotPiperDataConfig(
+            repo_id="csuvla/grasp_banana",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(
+                local_files_only=True,
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "s3://openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
     ),
 ]
 
