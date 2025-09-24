@@ -134,7 +134,7 @@ class CrossAttentionCritic(nnx.Module):
 
 class Mine(nnx.Module):
     """JAX/NNX implementation of the MINE estimator for Mutual Information."""
-    def __init__(self, critic: nnx.Module, loss_type: str = "mine", alpha: float = 0.01):
+    def __init__(self, critic: nnx.Module, loss_type: str = "mine_biased", alpha: float = 0.01):
         self.critic = critic
         self.running_mean = nnx.Variable(0.0)
         self.loss_type = loss_type
@@ -367,9 +367,9 @@ class Pi0(_model.BaseModel):
         l2_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
         if self.config.mi_beta > 0:
-            mi_loss = self.mine(prefix_tokens, prefix_out, key=mine_rng)
-            jax.debug.print("mi_est:{}", -1*mi_loss)
-            total_loss = l2_loss - self.config.mi_beta * mi_loss
+            mi_est = self.mine.get_mi(prefix_tokens, prefix_out, key=mine_rng)
+            jax.debug.print("mi_est:{}", mi_est)
+            total_loss = l2_loss + self.config.mi_beta * mi_est
             # jax.debug.print("mse_loss:{}", l2_loss)
             return total_loss
         else:
