@@ -129,13 +129,18 @@ class CrossAttentionCritic(nnx.Module):
         t_tokens = self.mlp_linear2(mlp_out)
         # --- MODIFICATION END ---
         # Squeeze to get logits per batch item
-        t_logits = jnp.mean(t_tokens, axis=1)
-        
-        # Apply tanh to bound the output and ensure stability
-        t = nnx.tanh(t_logits)
-        return t.squeeze(axis=-1)
-        # t = jnp.mean(t_tokens, axis=1)
+        #         +tanh时打印的logints
+        #         t_logits:0.0028918583411723375 
+        #         t_logits:0.0031934063881635666 
+        # t_logits = jnp.mean(t_tokens, axis=1)   # [B]
+        # jax.debug.print("t_logits:{} ", jnp.mean(t_logits))
+        # # # Apply tanh to bound the output and ensure stability
+        # t = nnx.tanh(t_logits)
         # return t.squeeze(axis=-1)
+
+        t = jnp.mean(t_tokens, axis=1)   # [B]
+        jax.debug.print("mu_t_logits_without_tanh:{} ", jnp.mean(t))
+        return t.squeeze(axis=-1)
 
 class Mine(nnx.Module):
     """JAX/NNX implementation of the MINE estimator for Mutual Information."""
@@ -149,10 +154,19 @@ class Mine(nnx.Module):
         if z_marg is None:
             perm = jax.random.permutation(key, z.shape[0])
             z_marg = z[perm]
+        """
+        E_joint[...]: 数学期望，这里的样本 (x, z) 是从它们的联合分布中抽取的。
+        也就是说，x 和 z 是真实配对的（例如，z 是由 x 通过主模型计算得到的）。
+
+        E_marginal[...]: 数学期望，这里的样本 (x, z') 是从它们的边缘分布的乘积中抽取的。
+        也就是说，x 和 z' 是随机配对的（例如，z' 是从同一个批次中随机抽取的另一个样本的输出）。
         
+        
+        """
         t = self.critic(x, z)
         t_marg = self.critic(x, z_marg)
 
+        # 用来计算真实互信息 I(X; Z) 的一个下界 (Lower Bound)
         if self.loss_type == "mine":
             second_term = ema_loss(t_marg, self.running_mean, self.alpha)
             mi_est = jnp.mean(t) - second_term
@@ -160,7 +174,11 @@ class Mine(nnx.Module):
             second_term = jnp.mean(jnp.exp(t_marg - 1))
             mi_est = jnp.mean(t) - second_term
         elif self.loss_type == "mine_biased":
-            second_term = logsumexp(t_marg, axis=0) - math.log(t_marg.shape[0])
+            #math.log(t_marg.shape[0]) =In(B) when B=16,  In16 =  2.7725887298583984
+            second_term = logsumexp(t_marg, axis=0) - math.log(t_marg.shape[0])  
+            jax.debug.print("logsumexp(t_marg, axis=0):{} ", logsumexp(t_marg, axis=0) )
+            jax.debug.print("math.log(t_marg.shape[0]:{} ", math.log(t_marg.shape[0]))
+            jax.debug.print("second_term:{} ", second_term)
             mi_est = jnp.mean(t) - second_term
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
@@ -373,8 +391,9 @@ class Pi0(_model.BaseModel):
 
         if self.config.mi_beta > 0:
             mi_est = self.mine.get_mi(prefix_tokens, prefix_out, key=mine_rng)
-            jax.debug.print("mi_est:{}", mi_est)
+            
             total_loss = l2_loss + self.config.mi_beta * mi_est
+            jax.debug.print("mi_est:{} mse_loss:{} total_loss:{}", mi_est, jnp.mean(l2_loss), jnp.mean(total_loss))
             # jax.debug.print("mse_loss:{}", l2_loss)
             return total_loss
         else:
