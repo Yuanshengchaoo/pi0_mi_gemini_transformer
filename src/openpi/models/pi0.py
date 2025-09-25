@@ -128,9 +128,14 @@ class CrossAttentionCritic(nnx.Module):
         mlp_out = nnx.gelu(mlp_out)
         t_tokens = self.mlp_linear2(mlp_out)
         # --- MODIFICATION END ---
+        # Squeeze to get logits per batch item
+        t_logits = jnp.mean(t_tokens, axis=1)
         
-        t = jnp.mean(t_tokens, axis=1)
+        # Apply tanh to bound the output and ensure stability
+        t = nnx.tanh(t_logits)
         return t.squeeze(axis=-1)
+        # t = jnp.mean(t_tokens, axis=1)
+        # return t.squeeze(axis=-1)
 
 class Mine(nnx.Module):
     """JAX/NNX implementation of the MINE estimator for Mutual Information."""
@@ -178,7 +183,7 @@ class Pi0Config(_model.BaseModelConfig):
     action_horizon: int = 50
     max_token_len: int = 48
     
-    mi_beta: float = 1.0
+    mi_beta: float = 0.0001
     critic_num_heads: int = 8
 
     @property
