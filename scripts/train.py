@@ -189,6 +189,71 @@ def train_step(
     }
     return new_state, info
 
+###新加###############
+@at.typecheck
+def mine_train_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """仅更新 MI-critic；通过 stop_gradient + 全树 grads(非critic=0) 实现。
+    且该函数对 x,z 做了 stop_gradient（只让 critic 学）。
+    """
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    @at.typecheck
+    def loss_fn(
+        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
+    ):
+        # 这里返回的是标量 -mi_est；compute_mine_model_loss 已对 x,z stop_gradient
+        return model.compute_mine_model_loss(rng, observation, actions, train=True)
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions = batch
+
+    # ❗用“全量可训练过滤器”，而不是只选 critic 子树
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+
+    mi_loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+
+    # ❗传入的 params 也保持与 opt_state 一致的“全量可训练树”
+    params = state.params.filter(config.trainable_filter)
+
+    # 非 critic 的梯度因为 stop_gradient 自然是 0；结构匹配 opt_state，不会报错
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    # 回写
+    nnx.update(model, new_params)
+    new_params_full = nnx.state(model)
+
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params_full, opt_state=new_opt_state)
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params_full
+            ),
+        )
+
+    # 只统计 critic 的参数范数（按你的实际路径改这个正则）
+    critic_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx_utils.PathRegex("(^|.*/)mine/critic(/|$)"),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    info = {
+        "mi_loss": mi_loss,
+        "mi_grad_norm": optax.global_norm(grads),          # 全树；非 critic 基本为 0
+        "mi_param_norm": optax.global_norm(critic_params),
+    }
+    return new_state, info
+######################
 
 def main(config: _config.TrainConfig):
     init_logging()
@@ -240,6 +305,14 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    ###new add############
+    ptrain_mine_step = jax.jit(
+        functools.partial(mine_train_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=(train_state_sharding, replicated_sharding),
+        donate_argnums=(1,),
+    )
+    
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -248,10 +321,23 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
+    mine_every = getattr(config, "mine_every", 1)          # 每隔多少个 step 训练一次 critic
+    mine_pretrain = getattr(config, "mine_pretrain", 0)    # 前若干步只训 critic（可选）
+    ######################
     infos = []
     for step in pbar:
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+            ######################
+            # 可选预热：前 mine_pretrain 步只训 critic
+            if step < mine_pretrain or (mine_every > 0 and (step - start_step) % mine_every == 0):
+                train_state, mi_info = ptrain_mine_step(train_rng, train_state, batch)
+            else:
+                mi_info = {}
+            ######################
+            train_state, main_info = ptrain_step(train_rng, train_state, batch)
+            # 合并日志
+        info = {**main_info, **mi_info}
+        ##################
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)

@@ -398,6 +398,55 @@ class Pi0(_model.BaseModel):
             return total_loss
         else:
             return l2_loss
+    
+    # === 新增：只训练 MINE/critic 的 loss ===
+    def compute_mine_model_loss(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, ""]:
+        """
+        仅用于训练 mi.critic：返回 -mi_est（标量）。
+        注意：对 x=prefix_tokens, z=prefix_out 做 stop_gradient，
+             避免把梯度传回主模型（embed/LLM 等）。
+        """
+        # 1) 预处理 & 构造与主模型一致的前缀/后缀序列（确保 prefix_out 与主流程一致）
+        preprocess_rng, noise_rng, time_rng, mine_rng = jax.random.split(rng, 4)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+        batch_shape = actions.shape[:-2]
+        noise = jax.random.normal(noise_rng, actions.shape)                       # [B, Ah, Ad]
+        time  = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001    # [B]
+        time_expanded = time[..., None, None]
+        x_t = time_expanded * noise + (1.0 - time_expanded) * actions             # diffusion 缓冲
+
+        # 2) 和主模型一致地走一遍 embed & LLM，拿到 prefix_tokens / prefix_out
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)          # [B, Lp, D]
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_suffix(observation, x_t, time)  # [B, Ls, D]
+
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)          # [B, Lp+Ls]
+        ar_mask    = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        positions  = jnp.cumsum(input_mask, axis=1) - 1
+
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=make_attn_mask(input_mask, ar_mask),
+            positions=positions,
+        )  # prefix_out: [B, Lp, D]
+
+        # 3) 停止梯度：只让 critic 学习
+        x = jax.lax.stop_gradient(prefix_tokens)   # [B, Lp, D]
+        z = jax.lax.stop_gradient(prefix_out)      # [B, Lp, D]
+
+        # 4) MINE 损失（-mi_est）：你的 Mine.__call__ 已返回 -mi_est
+        mi_loss = self.mine(x, z, key=mine_rng)    # 标量或 [B]，一般取 mean
+        return jnp.mean(mi_loss)
+
+
+
 
     @override
     def sample_actions(
@@ -446,3 +495,6 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+    
+
+
